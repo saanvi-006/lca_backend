@@ -5,6 +5,11 @@ import pandas as pd
 import numpy as np
 import os
 import google.generativeai as genai
+import logging
+
+# ------------------ Setup logging ------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ------------------ Load trained model ------------------
 model = joblib.load("lca_demo_model.joblib")
@@ -45,14 +50,8 @@ def get_feature_importances(model):
 def call_llm(prompt, conversation_id=None):
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        if conversation_id and conversation_id in conversation_history:
-            prompt = f"Conversation context: {conversation_history[conversation_id]}\n\n{prompt}"
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=500
-            ),
+        model = genai.GenerativeModel(
+            'gemini-2.5-flash',
             safety_settings={
                 'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
                 'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
@@ -60,13 +59,25 @@ def call_llm(prompt, conversation_id=None):
                 'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
             }
         )
-        # Check for safety block
+        if conversation_id and conversation_id in conversation_history:
+            prompt = f"Previous context: {conversation_history[conversation_id]}\n\n{prompt}"
+        logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")  # Log first 100 chars
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500
+            )
+        )
         if response.candidates and response.candidates[0].finish_reason == 2:  # SAFETY
-            return "Response blocked due to safety filters. Please simplify or rephrase the request."
+            logger.warning("Gemini API blocked response due to safety filters.")
+            return "Response blocked by safety filters. Try simplifying the request."
         if not response.text:
+            logger.warning("Gemini API returned no valid response text.")
             return "No valid response from Gemini API."
+        logger.info("Gemini API response received successfully.")
         return response.text
     except Exception as e:
+        logger.error(f"Gemini API Error: {str(e)}")
         return f"Gemini API Error: {str(e)}"
 
 def recommend_changes_top_features(row, model, role, conversation_id):
@@ -78,22 +89,14 @@ def recommend_changes_top_features(row, model, role, conversation_id):
 
     if role:
         prompt = f"""
-        You are an expert in sustainable manufacturing, assisting a {role}.
-        Given:
-        - Key features: {top_features}
-        - Values: {input_data}
-        - Impact score: {impact_score:.2f} ({impact_level})
-        Suggest practical steps to improve sustainability, tailored to a {role}'s priorities (e.g., technical solutions for engineers).
-        Keep it concise, under 150 words.
+        As an expert in sustainable manufacturing, assist a {role}.
+        Given key factors: {top_features} with values {input_data} and score {impact_score:.2f} ({impact_level}).
+        Suggest practical sustainability improvements tailored to a {role}'s role, in under 150 words.
         """
     else:
         prompt = f"""
-        You are an expert in sustainable manufacturing.
-        Given:
-        - Key features: {top_features}
-        - Values: {input_data}
-        - Impact score: {impact_score:.2f} ({impact_level})
-        Suggest practical steps to improve sustainability (e.g., increase recycling, reduce energy use).
+        As an expert in sustainable manufacturing, suggest practical sustainability improvements.
+        Given key factors: {top_features} with values {input_data} and score {impact_score:.2f} ({impact_level}).
         Keep it concise, under 150 words.
         """
 
@@ -160,9 +163,11 @@ def predict():
             }
         }
 
+        logger.info(f"Prediction successful for conversation_id: {conversation_id}")
         return jsonify(result)
 
     except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
         return jsonify({"error": str(e)}), 400
 
 @app.route("/followup", methods=["POST"])
@@ -174,33 +179,23 @@ def followup():
         role = data.get("role", "")
 
         if not conversation_id or conversation_id not in conversation_history:
+            logger.error(f"Invalid or missing conversation_id: {conversation_id}")
             return jsonify({"error": "Invalid or missing conversation_id"}), 400
 
         context = conversation_history[conversation_id]
 
         if role:
             prompt = f"""
-            You are an expert in sustainable manufacturing, assisting a {role}.
-            Previous context:
-            - Inputs: {context['inputs']}
-            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
-            - Top features: {context['top_features']}
-            - Previous recommendations: {context['recommendations']}
-            User question: "{question}"
-            Provide a concise answer tailored to a {role}'s priorities.
-            Keep it under 100 words.
+            As an expert in sustainable manufacturing, assist a {role}.
+            Given previous inputs: {context['inputs']} and score: {context['impact_score']:.2f} ({context['impact_level']}).
+            Answer this question: {question}
+            Keep the response concise, under 100 words, tailored to a {role}'s priorities.
             """
         else:
             prompt = f"""
-            You are an expert in sustainable manufacturing.
-            Previous context:
-            - Inputs: {context['inputs']}
-            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
-            - Top features: {context['top_features']}
-            - Previous recommendations: {context['recommendations']}
-            User question: "{question}"
-            Provide a concise answer.
-            Keep it under 100 words.
+            As an expert in sustainable manufacturing, answer this question: {question}
+            Given previous inputs: {context['inputs']} and score: {context['impact_score']:.2f} ({context['impact_level']}).
+            Keep the response concise, under 100 words.
             """
 
         answer = call_llm(prompt, conversation_id)
@@ -208,9 +203,11 @@ def followup():
         conversation_history[conversation_id]["last_question"] = question
         conversation_history[conversation_id]["last_answer"] = answer
 
+        logger.info(f"Follow-up successful for conversation_id: {conversation_id}")
         return jsonify({"conversation_id": conversation_id, "answer": answer})
 
     except Exception as e:
+        logger.error(f"Follow-up error: {str(e)}")
         return jsonify({"error": str(e)}), 400
 
 # ------------------ Run server ------------------

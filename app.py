@@ -47,48 +47,90 @@ def get_feature_importances(model):
 
     return [(feature_names[i], round(importances[i] * 100, 2)) for i in indices]
 
-def call_llm(prompt, conversation_id=None):
+def generate_fallback_recommendations(role=None, impact_score=None, impact_level=None, top_features=None):
+    """Generate basic recommendations when Gemini API fails."""
+    role_prefix = f"As a {role}, " if role else ""
+    
+    base_recommendations = f"""{role_prefix}here are key sustainability improvements for your manufacturing process:
+
+• **Increase Recycling Rate**: Aim for 70-80% recycled content to significantly reduce environmental impact and resource consumption
+
+• **Optimize Energy Efficiency**: Focus on renewable energy sources and process optimization to reduce carbon footprint
+
+• **Minimize Transport Distance**: Source materials locally when possible to reduce transportation emissions
+
+• **Implement Water Conservation**: Use closed-loop water systems and recycling to minimize water usage
+
+• **Enhance Material Efficiency**: Apply lean manufacturing principles to reduce waste and improve resource utilization
+
+These strategic changes can help move your sustainability score from {impact_level if impact_level else 'current'} to a better category."""
+
+    return base_recommendations
+
+def call_llm(prompt, conversation_id=None, role=None, impact_score=None, impact_level=None, top_features=None):
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model_instance = genai.GenerativeModel(
+            'gemini-2.0-flash-exp',  # Use latest available model
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            }
+        )
 
+        # Attach conversation history if available
         if conversation_id and conversation_id in conversation_history:
             context = conversation_history[conversation_id]
-            simplified_context = (
-                f"Previous inputs: {context['inputs']}\n"
-                f"Previous impact score: {context['impact_score']:.2f}\n"
-                f"Previous recommendations: {context.get('recommendations', '')}"
-            )
-            prompt = f"Previous context:\n{simplified_context}\n\n{prompt}"
+            prompt = f"Previous context: {context}\n\n{prompt}"
 
         logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")
 
-        response = model.generate_content(
+        response = model_instance.generate_content(
             prompt,
-            generation_config=genai.types.GenerationConfig(max_output_tokens=500)
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=40
+            )
         )
 
-        # ✅ SAFELY extract text from candidates
+        # Check for blocked responses first
         if response.candidates:
             candidate = response.candidates[0]
+            
+            # Check finish reason for safety blocks
+            if hasattr(candidate, 'finish_reason'):
+                finish_reason = candidate.finish_reason
+                if finish_reason == 2:  # SAFETY
+                    logger.warning("Response blocked by safety filters")
+                    return generate_fallback_recommendations(role, impact_score, impact_level, top_features)
+                elif finish_reason == 3:  # RECITATION
+                    logger.warning("Response blocked due to recitation")
+                    return generate_fallback_recommendations(role, impact_score, impact_level, top_features)
+                elif finish_reason == 4:  # OTHER
+                    logger.warning("Response blocked for other reasons")
+                    return generate_fallback_recommendations(role, impact_score, impact_level, top_features)
 
-            # If blocked by safety filters
-            if candidate.finish_reason == 2:
-                logger.warning("Gemini API blocked response due to safety filters.")
-                return "Response blocked by safety filters."
-
+            # Extract text from parts safely
             if candidate.content and candidate.content.parts:
-                reply = "".join([p.text for p in candidate.content.parts if hasattr(p, "text")])
+                reply = "".join([
+                    part.text for part in candidate.content.parts 
+                    if hasattr(part, "text") and part.text
+                ])
                 if reply.strip():
                     logger.info("Gemini API response received successfully.")
                     return reply.strip()
 
-        logger.warning("Gemini API returned no usable text.")
-        return "No valid response from Gemini API."
+        # Fallback if no valid response
+        logger.warning("Gemini API returned no usable text. Using fallback recommendations.")
+        return generate_fallback_recommendations(role, impact_score, impact_level, top_features)
 
     except Exception as e:
         logger.error(f"Gemini API Error: {str(e)}")
-        return f"Gemini API Error: {str(e)}"
+        return generate_fallback_recommendations(role, impact_score, impact_level, top_features)
 
 def recommend_changes_top_features(row, model, role, conversation_id):
     """Generate role-specific recommendations using Gemini for top 3 features."""
@@ -97,21 +139,35 @@ def recommend_changes_top_features(row, model, role, conversation_id):
     impact_score = model.predict(pd.DataFrame([row]))[0]
     impact_level = categorize_level(impact_score)
 
+    # Create more specific and safer prompts
     if role:
         prompt = f"""
-        As an expert in sustainable manufacturing, assist a {role}.
-        Given key factors: {top_features} with values {input_data} and score {impact_score:.2f} ({impact_level}).
-        Suggest practical sustainability improvements tailored to a {role}'s role, in under 150 words.
+        You are a sustainability consultant helping a {role} improve manufacturing processes.
+        
+        Current situation:
+        - Key environmental factors: {', '.join(top_features)}
+        - Current values: {input_data}
+        - Environmental impact score: {impact_score:.2f} (classified as {impact_level})
+        
+        Provide 3-5 specific, actionable recommendations for a {role} to improve sustainability.
+        Focus on practical steps they can implement. Keep response under 150 words.
         """
     else:
         prompt = f"""
-        As an expert in sustainable manufacturing, suggest practical sustainability improvements.
-        Given key factors: {top_features} with values {input_data} and score {impact_score:.2f} ({impact_level}).
-        Keep it concise, under 150 words.
+        You are a sustainability consultant for manufacturing processes.
+        
+        Current situation:
+        - Key environmental factors: {', '.join(top_features)}
+        - Current values: {input_data}
+        - Environmental impact score: {impact_score:.2f} (classified as {impact_level})
+        
+        Provide 3-5 specific, actionable sustainability improvements.
+        Focus on practical implementation steps. Keep response under 150 words.
         """
 
-    recommendations = call_llm(prompt, conversation_id)
+    recommendations = call_llm(prompt, conversation_id, role, impact_score, impact_level, top_features)
 
+    # Store conversation context
     if conversation_id:
         conversation_history[conversation_id] = {
             "inputs": row,
@@ -136,6 +192,8 @@ def predict():
         inputs = data.get("inputs", {})
         conversation_id = data.get("conversation_id", str(np.random.randint(1000000)))
 
+        logger.info(f"Processing prediction request for conversation_id: {conversation_id}")
+
         # Convert inputs to DataFrame
         df_row = pd.DataFrame([inputs])
 
@@ -143,7 +201,13 @@ def predict():
         score = model.predict(df_row)[0]
         level = categorize_level(score)
         top_factors = get_feature_importances(model)[:3]
-        recs = recommend_changes_top_features(inputs, model, role, conversation_id)
+        
+        # Get recommendations with better error handling
+        try:
+            recs = recommend_changes_top_features(inputs, model, role, conversation_id)
+        except Exception as rec_error:
+            logger.error(f"Error generating recommendations: {str(rec_error)}")
+            recs = generate_fallback_recommendations(role, score, level, [f[0] for f in top_factors])
 
         # Prepare chart data
         impact_summary = {
@@ -154,6 +218,7 @@ def predict():
 
         circularity_score = round(inputs.get("recycling_rate", 0) * 100, 2)
 
+        # Calculate scenario comparison
         scenario_data = {**inputs, "recycling_rate": 0.8}
         scenarios = {
             "Current": float(score),
@@ -178,7 +243,7 @@ def predict():
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
 
 @app.route("/followup", methods=["POST"])
 def followup():
@@ -190,26 +255,46 @@ def followup():
 
         if not conversation_id or conversation_id not in conversation_history:
             logger.error(f"Invalid or missing conversation_id: {conversation_id}")
-            return jsonify({"error": "Invalid or missing conversation_id"}), 400
+            return jsonify({"error": "Invalid or missing conversation_id. Please start a new prediction first."}), 400
+
+        if not question or not question.strip():
+            return jsonify({"error": "Question cannot be empty"}), 400
 
         context = conversation_history[conversation_id]
+        logger.info(f"Processing follow-up question for conversation_id: {conversation_id}")
 
+        # Create safer follow-up prompts
         if role:
             prompt = f"""
-            As an expert in sustainable manufacturing, assist a {role}.
-            Given previous inputs: {context['inputs']} and score: {context['impact_score']:.2f} ({context['impact_level']}).
-            Answer this question: {question}
-            Keep the response concise, under 100 words, tailored to a {role}'s priorities.
+            You are helping a {role} with sustainability questions about their manufacturing process.
+            
+            Context:
+            - Previous inputs: {context['inputs']}
+            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
+            - Top factors: {context['top_features']}
+            
+            Question: {question}
+            
+            Provide a helpful answer tailored to a {role}'s responsibilities and priorities.
+            Keep response under 100 words and be specific and actionable.
             """
         else:
             prompt = f"""
-            As an expert in sustainable manufacturing, answer this question: {question}
-            Given previous inputs: {context['inputs']} and score: {context['impact_score']:.2f} ({context['impact_level']}).
-            Keep the response concise, under 100 words.
+            You are a sustainability consultant answering questions about manufacturing processes.
+            
+            Context:
+            - Previous inputs: {context['inputs']}
+            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
+            - Top factors: {context['top_features']}
+            
+            Question: {question}
+            
+            Provide a helpful, specific answer. Keep response under 100 words.
             """
 
-        answer = call_llm(prompt, conversation_id)
+        answer = call_llm(prompt, conversation_id, role, context['impact_score'], context['impact_level'], context['top_features'])
 
+        # Update conversation history
         conversation_history[conversation_id]["last_question"] = question
         conversation_history[conversation_id]["last_answer"] = answer
 
@@ -218,9 +303,15 @@ def followup():
 
     except Exception as e:
         logger.error(f"Follow-up error: {str(e)}")
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": f"Follow-up failed: {str(e)}"}), 500
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "message": "LCA API is running"}), 200
 
 # ------------------ Run server ------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)

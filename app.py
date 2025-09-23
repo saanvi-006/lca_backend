@@ -10,9 +10,7 @@ import google.generativeai as genai
 model = joblib.load("lca_demo_model.joblib")
 
 # ------------------ Gemini API Configuration ------------------
-# Configure Gemini API (uses environment variable)
 genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-# If hardcoding (for testing only): genai.configure(api_key='your_api_key_here')
 
 # In-memory conversation store (for simplicity; use a database for production)
 conversation_history = {}
@@ -48,15 +46,25 @@ def call_llm(prompt, conversation_id=None):
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
-        # Include conversation history if provided
         if conversation_id and conversation_id in conversation_history:
             prompt = f"Conversation context: {conversation_history[conversation_id]}\n\n{prompt}"
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=500
-            )
+            ),
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            }
         )
+        # Check for safety block
+        if response.candidates and response.candidates[0].finish_reason == 2:  # SAFETY
+            return "Response blocked due to safety filters. Please simplify or rephrase the request."
+        if not response.text:
+            return "No valid response from Gemini API."
         return response.text
     except Exception as e:
         return f"Gemini API Error: {str(e)}"
@@ -68,32 +76,29 @@ def recommend_changes_top_features(row, model, role, conversation_id):
     impact_score = model.predict(pd.DataFrame([row]))[0]
     impact_level = categorize_level(impact_score)
 
-    # Build dynamic role-based prompt
     if role:
         prompt = f"""
-        You are an expert in sustainable processes, addressing a user identifying as a '{role}'.
-        Based on the following inputs and model results, provide tailored recommendations for their role:
-        - Top contributing features: {top_features}
-        - Input values: {input_data}
+        You are an expert in sustainable manufacturing, assisting a {role}.
+        Given:
+        - Key features: {top_features}
+        - Values: {input_data}
         - Impact score: {impact_score:.2f} ({impact_level})
-        Suggest actionable steps to reduce environmental impact, focusing on priorities relevant to a {role} (e.g., cost savings for industry, technical details for researchers, policy implications for policymakers).
-        Keep the response concise, under 150 words.
+        Suggest practical steps to improve sustainability, tailored to a {role}'s priorities (e.g., technical solutions for engineers).
+        Keep it concise, under 150 words.
         """
     else:
         prompt = f"""
-        You are an expert in sustainable processes, addressing a general user.
-        Based on the following inputs and model results, provide recommendations to reduce environmental impact:
-        - Top contributing features: {top_features}
-        - Input values: {input_data}
+        You are an expert in sustainable manufacturing.
+        Given:
+        - Key features: {top_features}
+        - Values: {input_data}
         - Impact score: {impact_score:.2f} ({impact_level})
-        Suggest actionable steps (e.g., increase recycling, optimize energy use) in a clear, general tone.
-        Keep the response concise, under 150 words.
+        Suggest practical steps to improve sustainability (e.g., increase recycling, reduce energy use).
+        Keep it concise, under 150 words.
         """
 
-    # Call Gemini API for recommendations
     recommendations = call_llm(prompt, conversation_id)
 
-    # Store context in conversation history
     if conversation_id:
         conversation_history[conversation_id] = {
             "inputs": row,
@@ -114,9 +119,9 @@ CORS(app)
 def predict():
     try:
         data = request.get_json()
-        role = data.get("role", "")  # Allow any role or empty string
+        role = data.get("role", "")
         inputs = data.get("inputs", {})
-        conversation_id = data.get("conversation_id", str(np.random.randint(1000000)))  # Generate unique ID
+        conversation_id = data.get("conversation_id", str(np.random.randint(1000000)))
 
         # Convert inputs to DataFrame
         df_row = pd.DataFrame([inputs])
@@ -124,7 +129,7 @@ def predict():
         # Model prediction
         score = model.predict(df_row)[0]
         level = categorize_level(score)
-        top_factors = get_feature_importances(model)[:3]  # Global top 3
+        top_factors = get_feature_importances(model)[:3]
         recs = recommend_changes_top_features(inputs, model, role, conversation_id)
 
         # Prepare chart data
@@ -136,14 +141,12 @@ def predict():
 
         circularity_score = round(inputs.get("recycling_rate", 0) * 100, 2)
 
-        # Example scenario: 80% recycling
         scenario_data = {**inputs, "recycling_rate": 0.8}
         scenarios = {
             "Current": float(score),
             "80% Recycled": float(model.predict(pd.DataFrame([scenario_data]))[0])
         }
 
-        # Build final response
         result = {
             "conversation_id": conversation_id,
             "impact_score": float(score),
@@ -168,46 +171,40 @@ def followup():
         data = request.get_json()
         conversation_id = data.get("conversation_id")
         question = data.get("question")
-        role = data.get("role", "")  # Allow any role or empty string
+        role = data.get("role", "")
 
         if not conversation_id or conversation_id not in conversation_history:
             return jsonify({"error": "Invalid or missing conversation_id"}), 400
 
-        # Retrieve context
         context = conversation_history[conversation_id]
 
-        # Build dynamic role-based follow-up prompt
         if role:
             prompt = f"""
-            You are an expert in sustainable processes, addressing a user identifying as a '{role}'.
+            You are an expert in sustainable manufacturing, assisting a {role}.
             Previous context:
             - Inputs: {context['inputs']}
             - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
             - Top features: {context['top_features']}
             - Previous recommendations: {context['recommendations']}
-            
-            The user asked: "{question}"
-            Provide a concise answer tailored to the {role} perspective, focusing on relevant priorities (e.g., cost savings for industry, technical details for researchers, policy implications for policymakers).
-            Keep the response under 100 words.
+            User question: "{question}"
+            Provide a concise answer tailored to a {role}'s priorities.
+            Keep it under 100 words.
             """
         else:
             prompt = f"""
-            You are an expert in sustainable processes, addressing a general user.
+            You are an expert in sustainable manufacturing.
             Previous context:
             - Inputs: {context['inputs']}
             - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
             - Top features: {context['top_features']}
             - Previous recommendations: {context['recommendations']}
-            
-            The user asked: "{question}"
-            Provide a concise answer in a clear, general tone, addressing the question directly.
-            Keep the response under 100 words.
+            User question: "{question}"
+            Provide a concise answer.
+            Keep it under 100 words.
             """
 
-        # Call Gemini API for follow-up response
         answer = call_llm(prompt, conversation_id)
 
-        # Update conversation history
         conversation_history[conversation_id]["last_question"] = question
         conversation_history[conversation_id]["last_answer"] = answer
 

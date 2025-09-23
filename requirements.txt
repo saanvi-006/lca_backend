@@ -5,3 +5,4 @@ pandas
 numpy
 scikit-learn
 gunicorn
+google-generativeai>=0.8.3

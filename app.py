@@ -50,15 +50,7 @@ def get_feature_importances(model):
 def call_llm(prompt, conversation_id=None):
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
-        model = genai.GenerativeModel(
-            'gemini-2.5-flash',
-            safety_settings={
-                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
-                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
-                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
-                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
-            }
-        )
+        model = genai.GenerativeModel('gemini-2.5-flash')
         if conversation_id and conversation_id in conversation_history:
             prompt = f"Previous context: {conversation_history[conversation_id]}\n\n{prompt}"
         logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")  # Log first 100 chars

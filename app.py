@@ -52,15 +52,24 @@ def call_llm(prompt, conversation_id=None):
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
         if conversation_id and conversation_id in conversation_history:
-            prompt = f"Previous context: {conversation_history[conversation_id]}\n\n{prompt}"
-        logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")  # Log first 100 chars
+            # Simplify the context
+            context = conversation_history[conversation_id]
+            simplified_context = (
+                f"Previous inputs: {context['inputs']}\n"
+                f"Previous impact score: {context['impact_score']:.2f}\n"
+                f"Previous recommendations: {context['recommendations']}"
+            )
+            # Prepend simplified context to the prompt
+            prompt = f"Previous context:\n{simplified_context}\n\n{prompt}"
+            
+        logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=500
             )
         )
-        if response.candidates and response.candidates[0].finish_reason == 2:  # SAFETY
+        if response.candidates and response.candidates[0].finish_reason == 2:
             logger.warning("Gemini API blocked response due to safety filters.")
             return "Response blocked by safety filters. Try simplifying the request."
         if not response.text:
@@ -71,6 +80,7 @@ def call_llm(prompt, conversation_id=None):
     except Exception as e:
         logger.error(f"Gemini API Error: {str(e)}")
         return f"Gemini API Error: {str(e)}"
+
 
 def recommend_changes_top_features(row, model, role, conversation_id):
     """Generate role-specific recommendations using Gemini for top 3 features."""

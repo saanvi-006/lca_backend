@@ -50,37 +50,37 @@ def get_feature_importances(model):
 def call_llm(prompt, conversation_id=None):
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel(
+            'gemini-2.5-flash',
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
+                'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+            }
+        )
+
         if conversation_id and conversation_id in conversation_history:
-            # Simplify the context
-            context = conversation_history[conversation_id]
-            simplified_context = (
-                f"Previous inputs: {context['inputs']}\n"
-                f"Previous impact score: {context['impact_score']:.2f}\n"
-                f"Previous recommendations: {context['recommendations']}"
-            )
-            # Prepend simplified context to the prompt
-            prompt = f"Previous context:\n{simplified_context}\n\n{prompt}"
-            
-        logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")
+            prompt = f"Previous context: {conversation_history[conversation_id]}\n\n{prompt}"
+
+        logger.info(f"Sending prompt to Gemini API: {prompt[:100]}...")  # Log first 100 chars
         response = model.generate_content(
             prompt,
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=500
             )
         )
-        if response.candidates and response.candidates[0].finish_reason == 2:
-            logger.warning("Gemini API blocked response due to safety filters.")
-            return "Response blocked by safety filters. Try simplifying the request."
+
         if not response.text:
             logger.warning("Gemini API returned no valid response text.")
             return "No valid response from Gemini API."
+
         logger.info("Gemini API response received successfully.")
-        return response.text
+        return response.text.strip()
+
     except Exception as e:
         logger.error(f"Gemini API Error: {str(e)}")
         return f"Gemini API Error: {str(e)}"
-
 
 def recommend_changes_top_features(row, model, role, conversation_id):
     """Generate role-specific recommendations using Gemini for top 3 features."""

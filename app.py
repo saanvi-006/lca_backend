@@ -4,9 +4,18 @@ import joblib
 import pandas as pd
 import numpy as np
 import os
+import google.generativeai as genai
 
 # ------------------ Load trained model ------------------
 model = joblib.load("lca_demo_model.joblib")
+
+# ------------------ Gemini API Configuration ------------------
+# Configure Gemini API (uses environment variable)
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+# If hardcoding (for testing only): genai.configure(api_key='your_api_key_here')
+
+# In-memory conversation store (for simplicity; use a database for production)
+conversation_history = {}
 
 # ------------------ Helper functions ------------------
 def categorize_level(score):
@@ -35,24 +44,67 @@ def get_feature_importances(model):
 
     return [(feature_names[i], round(importances[i] * 100, 2)) for i in indices]
 
-def recommend_changes_top_features(row, model):
-    """Provide recommendations only for the top 3 most important features."""
-    recs = []
+def call_llm(prompt, conversation_id=None):
+    """Call Google Gemini API with the given prompt and optional conversation context."""
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        # Include conversation history if provided
+        if conversation_id and conversation_id in conversation_history:
+            prompt = f"Conversation context: {conversation_history[conversation_id]}\n\n{prompt}"
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500
+            )
+        )
+        return response.text
+    except Exception as e:
+        return f"Gemini API Error: {str(e)}"
 
+def recommend_changes_top_features(row, model, role, conversation_id):
+    """Generate role-specific recommendations using Gemini for top 3 features."""
     top_features = [f for f, _ in get_feature_importances(model)[:3]]
+    input_data = {k: row.get(k, 0) for k in top_features}
+    impact_score = model.predict(pd.DataFrame([row]))[0]
+    impact_level = categorize_level(impact_score)
 
-    for f in top_features:
-        if f == "recycling_rate" and row.get(f, 0) < 0.5:
-            recs.append(f"Increase recycling rate from {row[f]*100:.0f}% → 50%+ to lower impact.")
-        elif f == "transport_km" and row.get(f, 0) > 200:
-            recs.append(f"Reduce transport distance by {row[f]-200} km → save emissions.")
-        elif f == "smelting_energy_mj_per_kg" and row.get(f, 0) > 70:
-            recs.append("Optimize smelting energy use (e.g., switch to renewable power).")
+    # Build dynamic role-based prompt
+    if role:
+        prompt = f"""
+        You are an expert in sustainable processes, addressing a user identifying as a '{role}'.
+        Based on the following inputs and model results, provide tailored recommendations for their role:
+        - Top contributing features: {top_features}
+        - Input values: {input_data}
+        - Impact score: {impact_score:.2f} ({impact_level})
+        Suggest actionable steps to reduce environmental impact, focusing on priorities relevant to a {role} (e.g., cost savings for industry, technical details for researchers, policy implications for policymakers).
+        Keep the response concise, under 150 words.
+        """
+    else:
+        prompt = f"""
+        You are an expert in sustainable processes, addressing a general user.
+        Based on the following inputs and model results, provide recommendations to reduce environmental impact:
+        - Top contributing features: {top_features}
+        - Input values: {input_data}
+        - Impact score: {impact_score:.2f} ({impact_level})
+        Suggest actionable steps (e.g., increase recycling, optimize energy use) in a clear, general tone.
+        Keep the response concise, under 150 words.
+        """
 
-    if not recs:
-        recs.append("Process is already efficient. Minor improvements possible.")
+    # Call Gemini API for recommendations
+    recommendations = call_llm(prompt, conversation_id)
 
-    return recs
+    # Store context in conversation history
+    if conversation_id:
+        conversation_history[conversation_id] = {
+            "inputs": row,
+            "impact_score": impact_score,
+            "impact_level": impact_level,
+            "top_features": top_features,
+            "recommendations": recommendations,
+            "role": role
+        }
+
+    return recommendations
 
 # ------------------ Flask API ------------------
 app = Flask(__name__)
@@ -62,25 +114,30 @@ CORS(app)
 def predict():
     try:
         data = request.get_json()
-        df_row = pd.DataFrame([data])
+        role = data.get("role", "")  # Allow any role or empty string
+        inputs = data.get("inputs", {})
+        conversation_id = data.get("conversation_id", str(np.random.randint(1000000)))  # Generate unique ID
+
+        # Convert inputs to DataFrame
+        df_row = pd.DataFrame([inputs])
 
         # Model prediction
         score = model.predict(df_row)[0]
         level = categorize_level(score)
-        top_factors = get_feature_importances(model)[:3]  # global top 3
-        recs = recommend_changes_top_features(data, model)
+        top_factors = get_feature_importances(model)[:3]  # Global top 3
+        recs = recommend_changes_top_features(inputs, model, role, conversation_id)
 
         # Prepare chart data
         impact_summary = {
-            "CO2 (kg/kg)": data.get("co2_kg_per_kg", 0),
-            "Energy (MJ/kg)": data.get("smelting_energy_mj_per_kg", 0) + data.get("mining_energy_mj_per_kg", 0),
-            "Water (L/kg)": data.get("water_usage_l_per_kg", 0)
+            "CO2 (kg/kg)": inputs.get("co2_kg_per_kg", 0),
+            "Energy (MJ/kg)": inputs.get("smelting_energy_mj_per_kg", 0) + inputs.get("mining_energy_mj_per_kg", 0),
+            "Water (L/kg)": inputs.get("water_usage_l_per_kg", 0)
         }
 
-        circularity_score = round(data.get("recycling_rate", 0) * 100, 2)
+        circularity_score = round(inputs.get("recycling_rate", 0) * 100, 2)
 
         # Example scenario: 80% recycling
-        scenario_data = {**data, "recycling_rate": 0.8}
+        scenario_data = {**inputs, "recycling_rate": 0.8}
         scenarios = {
             "Current": float(score),
             "80% Recycled": float(model.predict(pd.DataFrame([scenario_data]))[0])
@@ -88,6 +145,7 @@ def predict():
 
         # Build final response
         result = {
+            "conversation_id": conversation_id,
             "impact_score": float(score),
             "impact_level": level,
             "recommendations": recs,
@@ -100,6 +158,60 @@ def predict():
         }
 
         return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/followup", methods=["POST"])
+def followup():
+    try:
+        data = request.get_json()
+        conversation_id = data.get("conversation_id")
+        question = data.get("question")
+        role = data.get("role", "")  # Allow any role or empty string
+
+        if not conversation_id or conversation_id not in conversation_history:
+            return jsonify({"error": "Invalid or missing conversation_id"}), 400
+
+        # Retrieve context
+        context = conversation_history[conversation_id]
+
+        # Build dynamic role-based follow-up prompt
+        if role:
+            prompt = f"""
+            You are an expert in sustainable processes, addressing a user identifying as a '{role}'.
+            Previous context:
+            - Inputs: {context['inputs']}
+            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
+            - Top features: {context['top_features']}
+            - Previous recommendations: {context['recommendations']}
+            
+            The user asked: "{question}"
+            Provide a concise answer tailored to the {role} perspective, focusing on relevant priorities (e.g., cost savings for industry, technical details for researchers, policy implications for policymakers).
+            Keep the response under 100 words.
+            """
+        else:
+            prompt = f"""
+            You are an expert in sustainable processes, addressing a general user.
+            Previous context:
+            - Inputs: {context['inputs']}
+            - Impact score: {context['impact_score']:.2f} ({context['impact_level']})
+            - Top features: {context['top_features']}
+            - Previous recommendations: {context['recommendations']}
+            
+            The user asked: "{question}"
+            Provide a concise answer in a clear, general tone, addressing the question directly.
+            Keep the response under 100 words.
+            """
+
+        # Call Gemini API for follow-up response
+        answer = call_llm(prompt, conversation_id)
+
+        # Update conversation history
+        conversation_history[conversation_id]["last_question"] = question
+        conversation_history[conversation_id]["last_answer"] = answer
+
+        return jsonify({"conversation_id": conversation_id, "answer": answer})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400

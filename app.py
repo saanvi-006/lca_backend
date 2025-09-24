@@ -71,7 +71,7 @@ def call_llm(prompt, conversation_id=None, role=None, impact_score=None, impact_
     """Call Google Gemini API with the given prompt and optional conversation context."""
     try:
         model_instance = genai.GenerativeModel(
-            'gemini-2.0-flash-exp',  # Use latest available model
+            'gemini-1.5-flash',  # Use latest available model
             safety_settings={
                 'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
                 'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
@@ -315,3 +315,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Starting Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
